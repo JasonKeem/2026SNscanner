@@ -1,44 +1,80 @@
 package kr.whycombinator.examscan
 
-class Sample(val t: Long, val rssi: Int)
+import kotlin.math.log10
+import kotlin.math.pow
+import kotlin.math.roundToInt
+
+class Sample(val t: Long, val rssi: Float)
+
+/** 폰 수신 감도 보정값(dB). '1m 보정'으로 정해지고 모든 기기의 거리 계산에 더해진다. */
+object Cal {
+    var offset = 0f
+}
 
 /** 광고 패킷으로 관측된 BLE 발신원 하나. 키는 MAC 주소(랜덤 주소 포함). */
 class Dev(val address: String) {
     var name: String? = null
     var vendorId: Int = -1
     val uuids = LinkedHashSet<String>()
+    var txPower: Int = TX_UNKNOWN      // 광고에 실린 송신 출력(dBm). 없으면 0dBm으로 가정
     var lastRssi = -127
     var lastSeen = 0L
     var peak = -127
     var packets = 0
+    var inRange = false
 
-    private val recent = ArrayDeque<Sample>()   // 평활용 최근 구간
-    val history = ArrayDeque<Sample>()          // 그래프용 30초
+    val history = ArrayDeque<Sample>() // 필터를 거친 값, 그래프용 30초
 
-    fun add(t: Long, rssi: Int) {
+    // --- 칼만 필터 상태 (상태 = RSSI dBm, 랜덤워크 모델) ---
+    private var x = -127.0
+    private var p = R_BASE
+    private var init = false
+    private var upRun = 0
+
+    /**
+     * 측정 한 건을 필터에 넣는다.
+     * - 폰이 움직이는 중이면 과정 잡음을 키워 빠르게 따라가고, 멈춰 있으면 줄여 강하게 평활한다.
+     * - 값이 갑자기 꺼지는 쪽(다중경로 페이딩)은 덜 믿고, 한 번뿐인 급등도 덜 믿는다.
+     */
+    fun add(t: Long, rssi: Int, moving: Boolean) {
+        packets++
+        if (!init || t - lastSeen > 8000) {
+            x = rssi.toDouble()
+            p = R_BASE
+            init = true
+            upRun = 0
+        } else {
+            val dt = (t - lastSeen).coerceIn(1, 3000) / 1000.0
+            p += (if (moving) Q_MOVING else Q_STILL) * dt
+            val innov = rssi - x
+            var r = R_BASE
+            if (innov < -6.0) r = R_DIP else if (innov > 10.0 && upRun == 0) r = R_SPIKE
+            upRun = if (innov > 6.0) upRun + 1 else 0
+            val k = p / (p + r)
+            x += k * innov
+            p *= (1 - k)
+        }
         lastRssi = rssi
         lastSeen = t
-        packets++
-        recent.addLast(Sample(t, rssi))
-        trim(t)
-        history.addLast(Sample(t, quantile()))
+        history.addLast(Sample(t, x.toFloat()))
         while (history.isNotEmpty() && t - history.first().t > 30_000) history.removeFirst()
     }
 
-    /** 최근 WINDOW 구간의 상위 75% 값. 순간적인 페이딩(값이 푹 꺼지는 현상)에 덜 흔들린다. */
-    fun smoothed(now: Long): Int {
-        trim(now)
-        return quantile()
-    }
+    fun value(): Double = x
+    fun smoothed(@Suppress("UNUSED_PARAMETER") now: Long): Int = x.roundToInt()
 
-    private fun trim(now: Long) {
-        while (recent.size > 1 && now - recent.first().t > WINDOW_MS) recent.removeFirst()
-    }
+    /** 1m에서 기대되는 RSSI. */
+    fun ref1m(): Double = (if (txPower != TX_UNKNOWN) txPower else 0) + REF_1M + Cal.offset
 
-    private fun quantile(): Int {
-        if (recent.isEmpty()) return lastRssi
-        val a = recent.map { it.rssi }.sorted()
-        return a[minOf(a.size - 1, a.size * 3 / 4)]
+    /** 로그-거리 경로손실 모델: d = 10^((P1m − RSSI) / (10·n)) */
+    fun distOf(rssi: Double): Double = 10.0.pow((ref1m() - rssi) / (10 * PATH_N))
+    fun dist(): Double = distOf(x)
+
+    /** 반경 안/밖 판정. 경계에서 깜빡이지 않도록 나갈 때는 반경의 1.3배를 넘어야 한다. */
+    fun updateRange(radius: Double): Boolean {
+        val d = dist()
+        inRange = if (inRange) d <= radius * 1.3 else d <= radius
+        return inRange
     }
 
     /** 최근 약 4초 동안 신호가 몇 dB 올랐는지. 4초 전 기록이 없거나 신호가 끊겼으면 0. */
@@ -51,7 +87,7 @@ class Dev(val address: String) {
             if (age < RISE_WINDOW_MS) break
         }
         val o = old ?: return 0
-        return smoothed(now) - o.rssi
+        return (x - o.rssi).roundToInt()
     }
 
     fun shortLabel(): String {
@@ -80,16 +116,25 @@ class Dev(val address: String) {
     }
 
     companion object {
-        const val WINDOW_MS = 1200L
+        const val TX_UNKNOWN = Int.MIN_VALUE
+        const val REF_1M = -59.0       // 송신 0dBm 기기를 1m에서 받았을 때의 통상값
+        const val PATH_N = 2.2         // 실내 가시거리 경로손실 지수
+        const val Q_MOVING = 6.0       // dB²/s
+        const val Q_STILL = 0.5
+        const val R_BASE = 16.0        // 측정 잡음 분산 (σ≈4dB)
+        const val R_DIP = 120.0
+        const val R_SPIKE = 80.0
         const val RISE_WINDOW_MS = 4000L
-        const val RISE_DB = 8          // 4초에 8dB 이상 오르면 급상승으로 표시
+        const val RISE_DB = 8          // 4초에 8dB(거리로는 절반 이하) 이상 가까워지면 급접근
+        const val MIN_M = 0.3
+        const val MAX_M = 12.0
 
-        /** RSSI → 대략적인 거리대. 기기·자세·장애물에 따라 크게 달라지므로 참고용. */
-        fun band(rssi: Int): String = when {
-            rssi >= -50 -> "1m 이내"
-            rssi >= -65 -> "1~3m"
-            rssi >= -78 -> "3~8m"
-            else -> "멀리 / 옆 교실"
+        fun fmt(d: Double): String = if (d >= 10) "10m+" else "%.1fm".format(d)
+
+        /** 그래프 세로 위치: 0(위, 0.3m) ~ 1(아래, 12m), 로그 눈금. */
+        fun yFrac(d: Double): Float {
+            val c = d.coerceIn(MIN_M, MAX_M)
+            return ((log10(c) - log10(MIN_M)) / (log10(MAX_M) - log10(MIN_M))).toFloat()
         }
     }
 }

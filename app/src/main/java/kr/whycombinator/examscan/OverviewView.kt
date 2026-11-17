@@ -10,12 +10,12 @@ import android.os.SystemClock
 import android.view.View
 
 /**
- * 기준 dBm 이상인 모든 기기의 최근 20초 RSSI를 한 화면에 겹쳐 그린다.
- * 급상승 중인 기기는 굵은 빨간 선으로 맨 위에 그려진다.
+ * 감지 반경 안에 들어온 모든 기기의 최근 20초 추정 거리를 한 화면에 겹쳐 그린다(위쪽이 가까움).
+ * 빠르게 가까워지는 기기는 굵은 빨간 선으로 맨 위에 그려진다.
  */
 class OverviewView(ctx: Context) : View(ctx) {
     var devs: List<Dev> = emptyList()
-    var minRssi = -90
+    var radius = 1.0
 
     private val d = resources.displayMetrics.density
     private val line = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -55,21 +55,21 @@ class OverviewView(ctx: Context) : View(ctx) {
         val now = SystemClock.elapsedRealtime()
         val span = 20_000f
 
-        fun y(r: Int) = hgt * (1f - (r.coerceIn(-100, -30) + 100) / 70f)
-
-        for (g in intArrayOf(-90, -70, -50)) {
-            c.drawLine(0f, y(g), pw, y(g), grid)
-            c.drawText("$g", 2 * d, y(g) - 2 * d, axis)
+        for (m in doubleArrayOf(0.5, 1.0, 2.0, 5.0, 10.0)) {
+            val gy = hgt * Dev.yFrac(m)
+            c.drawLine(0f, gy, pw, gy, grid)
+            c.drawText(Dev.fmt(m), 2 * d, gy - 2 * d, axis)
         }
+        val ry = hgt * Dev.yFrac(radius)
         path.reset()
-        path.moveTo(0f, y(minRssi))
-        path.lineTo(pw, y(minRssi))
+        path.moveTo(0f, ry)
+        path.lineTo(pw, ry)
         c.drawPath(path, thr)
 
         if (devs.isEmpty()) {
             text.color = 0xFF9E9E9E.toInt()
             text.typeface = Typeface.DEFAULT
-            c.drawText("기준 이상으로 잡히는 기기가 없습니다", 12 * d, hgt / 2, text)
+            c.drawText("반경 안에 잡히는 기기가 없습니다", 12 * d, hgt / 2, text)
             return
         }
 
@@ -91,7 +91,7 @@ class OverviewView(ctx: Context) : View(ctx) {
                 val age = (now - s.t).toFloat()
                 if (age > span) continue
                 lx = pw * (1f - age / span)
-                ly = y(s.rssi)
+                ly = hgt * Dev.yFrac(dev.distOf(s.rssi.toDouble()))
                 if (first) {
                     path.moveTo(lx, ly)
                     first = false
@@ -104,11 +104,10 @@ class OverviewView(ctx: Context) : View(ctx) {
             dot.color = color
             c.drawCircle(lx, ly, if (hot) 5 * d else 3 * d, dot)
 
-            val s = dev.smoothed(now)
-            labels.add(Lbl(ly, (if (hot) "▲+$rise " else "") + dev.shortLabel() + " $s", color, hot))
+            labels.add(Lbl(ly, (if (hot) "▲ " else "") + dev.shortLabel() + " " + Dev.fmt(dev.dist()), color, hot))
         }
 
-        // 이름표: 급상승 기기 전부 + 나머지는 위쪽(강한 신호)부터, 최대 7개. 서로 겹치지 않게 밀어낸다.
+        // 이름표: 급접근 기기 전부 + 나머지는 위쪽(가까운 기기)부터, 최대 7개. 서로 겹치지 않게 밀어낸다.
         val picked = labels.sortedWith(compareBy<Lbl> { !it.hot }.thenBy { it.y }).take(7).sortedBy { it.y }
         val gap = 15 * d
         var prev = -gap

@@ -6,6 +6,10 @@ import android.bluetooth.le.ScanResult
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Typeface
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.location.LocationManager
 import android.media.AudioManager
 import android.media.ToneGenerator
@@ -29,6 +33,8 @@ import android.widget.ProgressBar
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
+import kotlin.math.abs
+import kotlin.math.sqrt
 
 class MainActivity : Activity() {
 
@@ -36,11 +42,19 @@ class MainActivity : Activity() {
     private val excluded = HashSet<String>()
     private var shown: List<Dev> = emptyList()
     private var tracked: Dev? = null
-    private var minRssi = -90
+    private var radius = 1.0             // 감지 반경(m). 기본 1m
     private var soundOn = false          // 시험장은 정숙해야 하므로 기본은 진동만
     private var scanning = false
     private var scanStartedAt = 0L
     private var lastError: String? = null
+    private val enterAlerted = HashMap<String, Long>()
+    private var wasIn = HashSet<String>()
+
+    // 폰 움직임 감지 (가속도계) → 필터 반응 속도 조절
+    private var moving = true
+    private var motionEma = 0f
+    private var lastMoveAt = 0L
+    private var sensors: SensorManager? = null
 
     private lateinit var scanner: BleScanner
     private val h = Handler(Looper.getMainLooper())
@@ -53,20 +67,23 @@ class MainActivity : Activity() {
     private lateinit var listPanel: LinearLayout
     private lateinit var trackPanel: LinearLayout
     private lateinit var tTitle: TextView
-    private lateinit var tRssi: TextView
+    private lateinit var tDist: TextView
     private lateinit var tBand: TextView
     private lateinit var tHint: TextView
     private lateinit var graph: TrackView
     private lateinit var overview: OverviewView
-    private val riseAlerted = HashMap<String, Long>()
     private lateinit var btnSound: Button
     private val listAdapter = DevAdapter()
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+    private fun prefs() = getSharedPreferences("examscan", Context.MODE_PRIVATE)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) // 화면이 꺼지면 필터 없는 스캔이 멈춘다
+        Cal.offset = prefs().getFloat("cal", 0f)
+        radius = prefs().getFloat("radius", 1.0f).toDouble().coerceIn(0.5, 10.0)
+
         scanner = BleScanner(this, ::onScan) { code ->
             scanning = false
             lastError = "스캔 실패 (코드 $code). 블루투스를 껐다 켠 뒤 다시 시도하세요."
@@ -78,8 +95,25 @@ class MainActivity : Activity() {
         } catch (e: RuntimeException) {
             null
         }
+        sensors = getSystemService(Context.SENSOR_SERVICE) as SensorManager?
+        val acc = sensors?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        if (acc != null) sensors?.registerListener(motionListener, acc, SensorManager.SENSOR_DELAY_GAME)
+
         buildUi()
         h.post(refresher)
+    }
+
+    private val motionListener = object : SensorEventListener {
+        override fun onSensorChanged(e: SensorEvent) {
+            val v = e.values
+            val mag = sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
+            motionEma += 0.1f * (abs(mag - SensorManager.GRAVITY_EARTH) - motionEma)
+            val now = SystemClock.elapsedRealtime()
+            if (motionEma > 0.35f) lastMoveAt = now
+            moving = now - lastMoveAt < 1000
+        }
+
+        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
     }
 
     // ---------- 화면 구성 ----------
@@ -108,6 +142,7 @@ class MainActivity : Activity() {
             setOnClickListener {
                 devs.clear()
                 excluded.clear()
+                wasIn.clear()
                 toast("목록과 제외 기준을 모두 지웠습니다")
             }
         }
@@ -116,31 +151,36 @@ class MainActivity : Activity() {
         row.addView(btnReset, LinearLayout.LayoutParams(0, wrap, 0.9f))
         listPanel.addView(row, LinearLayout.LayoutParams(match, wrap))
 
-        filterLabel = TextView(this).apply { textSize = 13f }
+        filterLabel = TextView(this).apply {
+            textSize = 16f
+            setTypeface(null, Typeface.BOLD)
+        }
         listPanel.addView(filterLabel, LinearLayout.LayoutParams(match, wrap))
         val seek = SeekBar(this).apply {
-            max = 60                       // -100 ~ -40 dBm
-            progress = minRssi + 100
+            max = 19                        // 0.5m ~ 10m, 0.5m 단위
+            progress = (radius / 0.5).toInt() - 1
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                    minRssi = -100 + p
+                    radius = 0.5 * (p + 1)
                     updateFilterLabel()
                 }
 
                 override fun onStartTrackingTouch(sb: SeekBar?) {}
-                override fun onStopTrackingTouch(sb: SeekBar?) {}
+                override fun onStopTrackingTouch(sb: SeekBar?) {
+                    prefs().edit().putFloat("radius", radius.toFloat()).apply()
+                }
             })
         }
         listPanel.addView(seek, LinearLayout.LayoutParams(match, wrap))
 
+        overview = OverviewView(this)
+        listPanel.addView(overview, LinearLayout.LayoutParams(match, 0, 1.3f))
         val list = ListView(this).apply {
             adapter = listAdapter
             onItemClickListener = AdapterView.OnItemClickListener { _, _, pos, _ ->
                 shown.getOrNull(pos)?.let { startTracking(it) }
             }
         }
-        overview = OverviewView(this)
-        listPanel.addView(overview, LinearLayout.LayoutParams(match, 0, 1.3f))
         listPanel.addView(list, LinearLayout.LayoutParams(match, 0, 1f))
         root.addView(listPanel, LinearLayout.LayoutParams(match, 0, 1f))
 
@@ -154,13 +194,13 @@ class MainActivity : Activity() {
             setTypeface(null, Typeface.BOLD)
             setPadding(0, dp(8), 0, 0)
         }
-        tRssi = TextView(this).apply {
-            textSize = 84f
+        tDist = TextView(this).apply {
+            textSize = 76f
             gravity = Gravity.CENTER
             setTypeface(null, Typeface.BOLD)
         }
         tBand = TextView(this).apply {
-            textSize = 20f
+            textSize = 16f
             gravity = Gravity.CENTER
         }
         tHint = TextView(this).apply {
@@ -171,7 +211,7 @@ class MainActivity : Activity() {
         graph = TrackView(this)
         val row2 = LinearLayout(this)
         val btnPeak = Button(this).apply {
-            text = "최고점 리셋"
+            text = "최근접 리셋"
             setOnClickListener { tracked?.peak = -127 }
         }
         btnSound = Button(this).apply {
@@ -187,12 +227,24 @@ class MainActivity : Activity() {
         row2.addView(btnPeak, LinearLayout.LayoutParams(0, wrap, 1f))
         row2.addView(btnSound, LinearLayout.LayoutParams(0, wrap, 1f))
         row2.addView(btnBack, LinearLayout.LayoutParams(0, wrap, 1f))
+        val btnCal = Button(this).apply {
+            text = "지금 이 기기가 정확히 1m 거리 (보정) · 길게 누르면 보정 초기화"
+            isAllCaps = false
+            setOnClickListener { calibrate() }
+            setOnLongClickListener {
+                Cal.offset = 0f
+                prefs().edit().putFloat("cal", 0f).apply()
+                toast("보정을 초기화했습니다")
+                true
+            }
+        }
 
         trackPanel.addView(tTitle, LinearLayout.LayoutParams(match, wrap))
-        trackPanel.addView(tRssi, LinearLayout.LayoutParams(match, wrap))
+        trackPanel.addView(tDist, LinearLayout.LayoutParams(match, wrap))
         trackPanel.addView(tBand, LinearLayout.LayoutParams(match, wrap))
         trackPanel.addView(tHint, LinearLayout.LayoutParams(match, wrap))
         trackPanel.addView(graph, LinearLayout.LayoutParams(match, 0, 1f))
+        trackPanel.addView(btnCal, LinearLayout.LayoutParams(match, wrap))
         trackPanel.addView(row2, LinearLayout.LayoutParams(match, wrap))
         root.addView(trackPanel, LinearLayout.LayoutParams(match, 0, 1f))
 
@@ -207,7 +259,7 @@ class MainActivity : Activity() {
     }
 
     private fun updateFilterLabel() {
-        filterLabel.text = "표시 기준: $minRssi dBm 이상 (오른쪽으로 밀수록 가까운 기기만)"
+        filterLabel.text = "감지 반경: %.1f m".format(radius)
     }
 
     private fun updateSoundButton() {
@@ -215,6 +267,19 @@ class MainActivity : Activity() {
     }
 
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+
+    /** 추적 중인 기기를 정확히 1m에 두고 누르면, 이 폰의 수신 감도 차이를 보정값으로 저장한다. */
+    private fun calibrate() {
+        val d = tracked ?: return
+        if (SystemClock.elapsedRealtime() - d.lastSeen > 3000) {
+            toast("신호가 끊긴 상태입니다. 신호가 잡힐 때 다시 누르세요.")
+            return
+        }
+        val expected = (if (d.txPower != Dev.TX_UNKNOWN) d.txPower else 0) + Dev.REF_1M
+        Cal.offset = (d.value() - expected).toFloat().coerceIn(-25f, 25f)
+        prefs().edit().putFloat("cal", Cal.offset).apply()
+        toast("보정 완료 (%+.0f dB). 폰을 5초쯤 가만히 둔 뒤 누르면 더 정확합니다.".format(Cal.offset))
+    }
 
     // ---------- 권한과 스캔 ----------
 
@@ -290,8 +355,13 @@ class MainActivity : Activity() {
         val addr = r.device?.address ?: return
         val now = SystemClock.elapsedRealtime()
         val d = devs.getOrPut(addr) { Dev(addr) }
-        d.add(now, rssi)
-        val rec = r.scanRecord ?: return
+        val rec = r.scanRecord
+        // 광고에 송신 출력이 실려 있으면 거리 계산의 기준으로 쓴다
+        var tx = r.txPower
+        if (tx == ScanResult.TX_POWER_NOT_PRESENT) tx = rec?.txPowerLevel ?: Int.MIN_VALUE
+        if (tx in -40..20) d.txPower = tx
+        d.add(now, rssi, moving)
+        if (rec == null) return
         rec.deviceName?.let { if (it.isNotBlank()) d.name = it }
         val m = rec.manufacturerSpecificData
         if (m != null && m.size() > 0) d.vendorId = m.keyAt(0)
@@ -304,7 +374,7 @@ class MainActivity : Activity() {
         val now = SystemClock.elapsedRealtime()
         val cur = devs.values.filter { now - it.lastSeen < 20_000 }.map { it.address }
         excluded.addAll(cur)
-        toast("${cur.size}개 기기를 제외했습니다")
+        toast("거리와 무관하게 지금 잡히는 ${cur.size}개 기기를 모두 제외했습니다")
     }
 
     // ---------- 추적 ----------
@@ -363,7 +433,7 @@ class MainActivity : Activity() {
     private val refresher = object : Runnable {
         override fun run() {
             refresh()
-            h.postDelayed(this, 250)
+            h.postDelayed(this, 200)
         }
     }
 
@@ -378,67 +448,71 @@ class MainActivity : Activity() {
         }
 
         val active = devs.values.filter { it.address !in excluded && now - it.lastSeen < 20_000 }
+        val inside = active.filter { it.updateRange(radius) }
         val sb = StringBuilder()
         sb.append(if (scanning) "● 스캔 중" else "○ 정지")
-        sb.append(" · 감지 ${active.size}개 · 제외 ${excluded.size}개")
+        sb.append(" · 반경 안 ${inside.size}개 / 전체 ${active.size}개 · 제외 ${excluded.size}개")
+        sb.append(if (moving) " · 이동 중" else " · 정지(정밀)")
         lastError?.let { sb.append("\n").append(it) }
         if (scanning && !locationOn()) sb.append("\n위치 서비스가 꺼져 있으면 결과가 안 나올 수 있습니다. 위치를 켜세요.")
         status.text = sb
 
         val d = tracked
         if (d == null) {
-            shown = active
-                .filter { it.smoothed(now) >= minRssi }
-                .sortedByDescending { if (now - it.lastSeen > 3000) it.smoothed(now) - 200 else it.smoothed(now) }
+            shown = inside.sortedBy { if (now - it.lastSeen > 3000) it.dist() + 1000 else it.dist() }
             listAdapter.notifyDataSetChanged()
             overview.devs = shown
-            overview.minRssi = minRssi
+            overview.radius = radius
             overview.invalidate()
-            alertRising(now)
+            alertEntering(now)
             return
         }
 
         val age = now - d.lastSeen
         if (age > 3000) {
-            tRssi.text = "—"
-            tRssi.setTextColor(0xFF9E9E9E.toInt())
+            tDist.text = "—"
+            tDist.setTextColor(0xFF9E9E9E.toInt())
             tBand.text = "신호 끊김 (${age / 1000}초 전)"
             tHint.text = "멀어졌거나 기기가 신호를 드물게 보냅니다. 잠시 멈춰서 기다려 보세요."
         } else {
             val s = d.smoothed(now)
             if (s > d.peak) d.peak = s
             val drop = d.peak - s
-            tRssi.text = "$s"
-            tRssi.setTextColor(
+            val dist = d.dist()
+            tDist.text = Dev.fmt(dist)
+            tDist.setTextColor(
                 when {
-                    s >= -50 -> 0xFFD32F2F.toInt()
-                    s >= -65 -> 0xFFF57C00.toInt()
+                    dist <= 1.0 -> 0xFFD32F2F.toInt()
+                    dist <= 3.0 -> 0xFFF57C00.toInt()
                     else -> 0xFF1565C0.toInt()
                 }
             )
-            tBand.text = "dBm · ${Dev.band(s)}"
+            tBand.text = "추정 거리 · $s dBm" + if (d.txPower != Dev.TX_UNKNOWN) " · 송신 ${d.txPower} dBm" else ""
+            val best = Dev.fmt(d.distOf(d.peak.toDouble()))
             tHint.text = when {
-                drop <= 2 -> "▲ 지금이 최고점입니다. 이 근처입니다."
-                drop >= 8 -> "지나쳤습니다. 최고점(${d.peak} dBm) 지점으로 돌아가세요."
-                else -> "최고점 ${d.peak} dBm · 현재 ${drop} dB 낮음"
+                drop <= 2 -> "▲ 지금이 가장 가깝습니다. 이 근처입니다."
+                drop >= 8 -> "지나쳤습니다. 가장 가까웠던 지점(약 $best)으로 돌아가세요."
+                else -> "최근접 약 $best · 지금은 그보다 멀어짐"
             }
         }
         graph.invalidate()
     }
 
-    /** 새로 급상승하기 시작한 기기가 있으면 짧게 두 번 진동 (기기당 6초에 한 번). */
-    private fun alertRising(now: Long) {
-        if (!scanning) return
+    /** 반경 안으로 새로 들어온 기기가 있으면 짧게 두 번 진동 (기기당 6초에 한 번). */
+    private fun alertEntering(now: Long) {
+        val cur = HashSet<String>()
         var fire = false
         for (d in shown) {
-            if (d.rise(now) < Dev.RISE_DB) continue
-            val last = riseAlerted[d.address] ?: 0L
+            cur.add(d.address)
+            if (d.address in wasIn) continue
+            val last = enterAlerted[d.address] ?: 0L
             if (now - last > 6000) {
-                riseAlerted[d.address] = now
+                enterAlerted[d.address] = now
                 fire = true
             }
         }
-        if (fire) {
+        wasIn = cur
+        if (fire && scanning) {
             try {
                 vib?.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 40, 80, 40), -1))
             } catch (_: Exception) {
@@ -448,6 +522,7 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         h.removeCallbacksAndMessages(null)
+        sensors?.unregisterListener(motionListener)
         scanner.stop()
         tone?.release()
         super.onDestroy()
@@ -476,7 +551,7 @@ class MainActivity : Activity() {
                 }
                 val sub = TextView(this@MainActivity).apply { textSize = 13f }
                 val bar = ProgressBar(this@MainActivity, null, android.R.attr.progressBarStyleHorizontal).apply {
-                    max = 70
+                    max = 100
                 }
                 view.addView(title)
                 view.addView(sub)
@@ -490,13 +565,13 @@ class MainActivity : Activity() {
             val d = shown[position]
             val now = SystemClock.elapsedRealtime()
             val s = d.smoothed(now)
+            val dist = d.dist()
             val age = (now - d.lastSeen) / 1000
-            val rise = d.rise(now)
-            val hot = rise >= Dev.RISE_DB
-            row.title.text = (if (hot) "▲+$rise 급상승 · " else "") + d.label()
+            val hot = d.rise(now) >= Dev.RISE_DB
+            row.title.text = (if (hot) "▲ 급접근 · " else "") + "약 ${Dev.fmt(dist)} · " + d.label()
             row.title.setTextColor(if (hot || d.isGlasses()) 0xFFD32F2F.toInt() else 0xFF212121.toInt())
-            row.sub.text = "$s dBm · ${Dev.band(s)} · ${d.address}" + if (age >= 3) " · ${age}초 전" else ""
-            row.bar.progress = (s + 100).coerceIn(0, 70)
+            row.sub.text = "$s dBm · ${d.address}" + if (age >= 3) " · ${age}초 전" else ""
+            row.bar.progress = ((1f - Dev.yFrac(dist)) * 100).toInt()
             return view
         }
     }
