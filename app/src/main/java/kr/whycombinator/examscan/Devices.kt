@@ -77,47 +77,6 @@ class Dev(val address: String) {
         return inRange
     }
 
-    // --- 방향 추정: 폰이 향한 방위(30° 구간)별 신호 세기 ---
-    private val binV = FloatArray(BINS)
-    private val binT = LongArray(BINS)
-
-    /** 폰이 heading(도) 방향을 향한 상태에서의 현재 필터값을 기록한다. */
-    fun addBearing(heading: Float, t: Long) {
-        val i = (((heading / (360f / BINS)).toInt() % BINS) + BINS) % BINS
-        val v = x.toFloat()
-        binV[i] = if (binT[i] == 0L || t - binT[i] > BIN_TTL_MS) v else binV[i] + 0.4f * (v - binV[i])
-        binT[i] = t
-    }
-
-    /**
-     * 기기가 있는 방위(도) 추정. 몸이 뒤쪽 신호를 가리므로, 폰을 몸 앞에 들고 돌았을 때
-     * 신호가 가장 센 방향이 기기 쪽이다. 절반 이상 돌지 않았거나 방향별 차이가 5dB 미만이면 NaN.
-     */
-    fun bearing(now: Long): Float {
-        var n = 0
-        var mx = -999f
-        var mn = 999f
-        for (i in 0 until BINS) {
-            if (binT[i] == 0L || now - binT[i] > BIN_TTL_MS) continue
-            n++
-            if (binV[i] > mx) mx = binV[i]
-            if (binV[i] < mn) mn = binV[i]
-        }
-        if (n < BINS / 2 || mx - mn < 5f) return Float.NaN
-        var sx = 0.0
-        var sy = 0.0
-        for (i in 0 until BINS) {
-            if (binT[i] == 0L || now - binT[i] > BIN_TTL_MS) continue
-            val w = (binV[i] - (mx - 8f)).coerceAtLeast(0f)
-            val a = Math.toRadians((i + 0.5) * (360.0 / BINS))
-            sx += w * kotlin.math.cos(a)
-            sy += w * kotlin.math.sin(a)
-        }
-        if (sx == 0.0 && sy == 0.0) return Float.NaN
-        val deg = Math.toDegrees(kotlin.math.atan2(sy, sx)).toFloat()
-        return (deg + 360f) % 360f
-    }
-
     /** 최근 약 4초 동안 신호가 몇 dB 올랐는지. 4초 전 기록이 없거나 신호가 끊겼으면 0. */
     fun rise(now: Long): Int {
         if (now - lastSeen > 3000) return 0
@@ -167,8 +126,6 @@ class Dev(val address: String) {
         const val R_SPIKE = 80.0
         const val RISE_WINDOW_MS = 4000L
         const val RISE_DB = 8          // 4초에 8dB(거리로는 절반 이하) 이상 가까워지면 급접근
-        const val BINS = 12
-        const val BIN_TTL_MS = 25_000L
         const val MIN_M = 0.3
         const val MAX_M = 12.0
 

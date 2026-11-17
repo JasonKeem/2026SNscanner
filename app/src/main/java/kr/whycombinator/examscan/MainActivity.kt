@@ -55,12 +55,6 @@ class MainActivity : Activity() {
     private var motionEma = 0f
     private var lastMoveAt = 0L
     private var sensors: SensorManager? = null
-    private var heading = Float.NaN      // 폰이 향한 방위(도)
-    private val rotM = FloatArray(9)
-    private val ori = FloatArray(3)
-    private var radarMode = true
-    private lateinit var radar: RadarView
-    private lateinit var btnView: Button
 
     private lateinit var scanner: BleScanner
     private val h = Handler(Looper.getMainLooper())
@@ -104,10 +98,6 @@ class MainActivity : Activity() {
         sensors = getSystemService(Context.SENSOR_SERVICE) as SensorManager?
         val acc = sensors?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
         if (acc != null) sensors?.registerListener(motionListener, acc, SensorManager.SENSOR_DELAY_GAME)
-        // 자기장 영향을 받지 않는 회전 센서를 우선 사용 (교실의 철제 책상이 나침반을 흔든다)
-        val rot = sensors?.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR)
-            ?: sensors?.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
-        if (rot != null) sensors?.registerListener(motionListener, rot, SensorManager.SENSOR_DELAY_GAME)
 
         buildUi()
         h.post(refresher)
@@ -115,12 +105,6 @@ class MainActivity : Activity() {
 
     private val motionListener = object : SensorEventListener {
         override fun onSensorChanged(e: SensorEvent) {
-            if (e.sensor.type != Sensor.TYPE_ACCELEROMETER) {
-                SensorManager.getRotationMatrixFromVector(rotM, e.values)
-                SensorManager.getOrientation(rotM, ori)
-                heading = ((Math.toDegrees(ori[0].toDouble()).toFloat()) + 360f) % 360f
-                return
-            }
             val v = e.values
             val mag = sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
             motionEma += 0.1f * (abs(mag - SensorManager.GRAVITY_EARTH) - motionEma)
@@ -171,16 +155,7 @@ class MainActivity : Activity() {
             textSize = 16f
             setTypeface(null, Typeface.BOLD)
         }
-        btnView = Button(this).apply {
-            setOnClickListener {
-                radarMode = !radarMode
-                updateViewMode()
-            }
-        }
-        val rowF = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
-        rowF.addView(filterLabel, LinearLayout.LayoutParams(0, wrap, 1f))
-        rowF.addView(btnView, LinearLayout.LayoutParams(wrap, wrap))
-        listPanel.addView(rowF, LinearLayout.LayoutParams(match, wrap))
+        listPanel.addView(filterLabel, LinearLayout.LayoutParams(match, wrap))
         val seek = SeekBar(this).apply {
             max = 19                        // 0.5m ~ 10m, 0.5m 단위
             progress = (radius / 0.5).toInt() - 1
@@ -198,8 +173,6 @@ class MainActivity : Activity() {
         }
         listPanel.addView(seek, LinearLayout.LayoutParams(match, wrap))
 
-        radar = RadarView(this)
-        listPanel.addView(radar, LinearLayout.LayoutParams(match, 0, 1.6f))
         overview = OverviewView(this)
         listPanel.addView(overview, LinearLayout.LayoutParams(match, 0, 1.6f))
         val list = ListView(this).apply {
@@ -279,13 +252,6 @@ class MainActivity : Activity() {
         updateScanButton()
         updateFilterLabel()
         updateSoundButton()
-        updateViewMode()
-    }
-
-    private fun updateViewMode() {
-        radar.visibility = if (radarMode) View.VISIBLE else View.GONE
-        overview.visibility = if (radarMode) View.GONE else View.VISIBLE
-        btnView.text = if (radarMode) "그래프로 보기" else "레이더로 보기"
     }
 
     private fun updateScanButton() {
@@ -395,7 +361,6 @@ class MainActivity : Activity() {
         if (tx == ScanResult.TX_POWER_NOT_PRESENT) tx = rec?.txPowerLevel ?: Int.MIN_VALUE
         if (tx in -40..20) d.txPower = tx
         d.add(now, rssi, moving)
-        if (!heading.isNaN()) d.addBearing(heading, now)
         if (rec == null) return
         rec.deviceName?.let { if (it.isNotBlank()) d.name = it }
         val m = rec.manufacturerSpecificData
@@ -499,9 +464,6 @@ class MainActivity : Activity() {
             overview.devs = shown
             overview.radius = radius
             overview.invalidate()
-            radar.devs = active
-            radar.radius = radius
-            radar.heading = heading
             alertEntering(now)
             return
         }
