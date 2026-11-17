@@ -41,6 +41,24 @@ class Dev(val address: String) {
         return a[minOf(a.size - 1, a.size * 3 / 4)]
     }
 
+    /** 최근 약 4초 동안 신호가 몇 dB 올랐는지. 4초 전 기록이 없거나 신호가 끊겼으면 0. */
+    fun rise(now: Long): Int {
+        if (now - lastSeen > 3000) return 0
+        var old: Sample? = null
+        for (s in history) {
+            val age = now - s.t
+            if (age in RISE_WINDOW_MS..(RISE_WINDOW_MS * 2)) old = s
+            if (age < RISE_WINDOW_MS) break
+        }
+        val o = old ?: return 0
+        return smoothed(now) - o.rssi
+    }
+
+    fun shortLabel(): String {
+        val base = name ?: Vendors.names[vendorId] ?: address.takeLast(5)
+        return if (base.length > 10) base.take(10) else base
+    }
+
     fun isGlasses(): Boolean {
         if (vendorId in Vendors.glassesIds) return true
         if (uuids.any { u -> Vendors.glassesUuidPrefixes.any { u.startsWith(it) } }) return true
@@ -63,6 +81,8 @@ class Dev(val address: String) {
 
     companion object {
         const val WINDOW_MS = 1200L
+        const val RISE_WINDOW_MS = 4000L
+        const val RISE_DB = 8          // 4초에 8dB 이상 오르면 급상승으로 표시
 
         /** RSSI → 대략적인 거리대. 기기·자세·장애물에 따라 크게 달라지므로 참고용. */
         fun band(rssi: Int): String = when {

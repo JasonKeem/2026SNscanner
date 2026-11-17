@@ -57,6 +57,8 @@ class MainActivity : Activity() {
     private lateinit var tBand: TextView
     private lateinit var tHint: TextView
     private lateinit var graph: TrackView
+    private lateinit var overview: OverviewView
+    private val riseAlerted = HashMap<String, Long>()
     private lateinit var btnSound: Button
     private val listAdapter = DevAdapter()
 
@@ -137,6 +139,8 @@ class MainActivity : Activity() {
                 shown.getOrNull(pos)?.let { startTracking(it) }
             }
         }
+        overview = OverviewView(this)
+        listPanel.addView(overview, LinearLayout.LayoutParams(match, 0, 1.3f))
         listPanel.addView(list, LinearLayout.LayoutParams(match, 0, 1f))
         root.addView(listPanel, LinearLayout.LayoutParams(match, 0, 1f))
 
@@ -387,6 +391,10 @@ class MainActivity : Activity() {
                 .filter { it.smoothed(now) >= minRssi }
                 .sortedByDescending { if (now - it.lastSeen > 3000) it.smoothed(now) - 200 else it.smoothed(now) }
             listAdapter.notifyDataSetChanged()
+            overview.devs = shown
+            overview.minRssi = minRssi
+            overview.invalidate()
+            alertRising(now)
             return
         }
 
@@ -416,6 +424,26 @@ class MainActivity : Activity() {
             }
         }
         graph.invalidate()
+    }
+
+    /** 새로 급상승하기 시작한 기기가 있으면 짧게 두 번 진동 (기기당 6초에 한 번). */
+    private fun alertRising(now: Long) {
+        if (!scanning) return
+        var fire = false
+        for (d in shown) {
+            if (d.rise(now) < Dev.RISE_DB) continue
+            val last = riseAlerted[d.address] ?: 0L
+            if (now - last > 6000) {
+                riseAlerted[d.address] = now
+                fire = true
+            }
+        }
+        if (fire) {
+            try {
+                vib?.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 40, 80, 40), -1))
+            } catch (_: Exception) {
+            }
+        }
     }
 
     override fun onDestroy() {
@@ -463,8 +491,10 @@ class MainActivity : Activity() {
             val now = SystemClock.elapsedRealtime()
             val s = d.smoothed(now)
             val age = (now - d.lastSeen) / 1000
-            row.title.text = d.label()
-            row.title.setTextColor(if (d.isGlasses()) 0xFFD32F2F.toInt() else 0xFF212121.toInt())
+            val rise = d.rise(now)
+            val hot = rise >= Dev.RISE_DB
+            row.title.text = (if (hot) "▲+$rise 급상승 · " else "") + d.label()
+            row.title.setTextColor(if (hot || d.isGlasses()) 0xFFD32F2F.toInt() else 0xFF212121.toInt())
             row.sub.text = "$s dBm · ${Dev.band(s)} · ${d.address}" + if (age >= 3) " · ${age}초 전" else ""
             row.bar.progress = (s + 100).coerceIn(0, 70)
             return view
